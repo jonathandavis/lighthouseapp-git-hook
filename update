@@ -1,0 +1,103 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+binmode STDIN, ':utf8';
+
+use LWP::UserAgent ();
+
+use Date::Format          qw/ time2str /;
+use HTTP::Request::Common qw/ POST     /;
+use XML::Simple           qw/ XMLout   /;
+use YAML                  qw/ Dump     /;
+
+#################################################
+# Configuration Options                         #
+#################################################
+my $git = '/home/jhelwig/bin/git';
+my %tokens = (
+    # Fallback token to use if one isn't found for an author.
+    'default' => '',
+    # Individual tokens for author/committer.
+    # If author email can't be found, committer's email will be tried.
+    'jacob@technosorcery.net' => undef,
+    'Another Author' => undef,
+);
+my $lighthouseapp_account_url = 'http://account-name.lighthouseapp.com';
+my $lighthouseapp_project_id = 0;
+
+#################################################
+
+shift @ARGV;
+my $old_sha1 = shift @ARGV;
+my $new_sha1 = shift @ARGV;
+
+my $rev_list = `$git rev-list --pretty=format:"" $old_sha1..$new_sha1`;
+$rev_list =~ s/^commit //gm;
+
+my @revs = reverse(split("\n", $rev_list));
+
+foreach my $rev (@revs) {
+    chomp(my $author_name = `$git show --pretty=format:"%an" $rev | sed q`);
+    chomp(my $author_email = `$git show --pretty=format:"%ae" $rev | sed q`);
+    chomp(my $author_date = `$git show --pretty=format:"%aD" $rev | sed q`);
+    chomp(my $committer_name = `$git show --pretty=format:"%cn" $rev | sed q`);
+    chomp(my $committer_email = `$git show --pretty=format:"%ce" $rev | sed q`);
+    chomp(my $committer_date = `$git show --pretty=format:"%cD" $rev | sed q`);
+    chomp(my $changed_at = time2str("%Y-%m-%dT%TZ", `$git show --pretty=format:"%ct" $rev | sed q`, 'GMT'));
+    chomp(my $commit_log = `$git log -n1 --pretty=medium $rev | sed '1,4d'`);
+
+    my $body = <<"HERE";
+$commit_log
+
+Author:     $author_name <$author_email>
+AuthorDate: $author_date
+Commit:     $committer_name <$committer_email>
+CommitDate: $committer_date
+HERE
+
+    chomp(my $commit_subject = `$git show --pretty=format:"%s" $rev | sed q`);
+    my $changes_yaml = Dump([
+        map { [ split(/\s+/, $_) ] } split("\n", `$git diff-tree -r --name-status $rev | sed '1d'`)
+    ]);
+
+    my $xml = XMLout({ 'changeset' => {
+            'title'      => [ $commit_subject, ],
+            'body'       => [ $body, ],
+            'revision'   => [ $rev, ],
+            'changes'    => {
+                'type'    => 'yaml',
+                'content' => $changes_yaml,
+            },
+            'changed-at' => {
+                'type'    => 'datetime',
+                'content' => $changed_at,
+            },
+        }},
+        KeepRoot => 1,
+    );
+
+    my $lh_token = defined($tokens{$author_email})
+        ? $tokens{$author_email}
+        : defined($tokens{$committer_email})
+            ? $tokens{$committer_email}
+            : $tokens{'default'};
+
+    my $ua = LWP::UserAgent->new();
+    $ua->timeout(3);
+    $ua->env_proxy();
+
+    my $response = $ua->simple_request(POST(
+        "$lighthouseapp_account_url/projects/$lighthouseapp_project_id/changesets.xml",
+        'content-type' => 'application/xml',
+        'X-LighthouseToken' => $lh_token,
+        Content => $xml
+    ));
+
+    unless ($response->is_success()) {
+        print $response->status_line() . "\n"
+            . $response->content() . "\n\n";
+
+    }
+}
